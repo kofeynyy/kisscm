@@ -71,7 +71,7 @@ class Emulator:
         self.output_area.config(state=tk.NORMAL)
         self.output_area.insert(tk.END, f"docker$ {command}\n")
         
-        # Обработка команды
+        # Обработка команд
         parts = shlex.split(command)
         if not parts:
             pass
