@@ -4,6 +4,132 @@ import shlex
 import argparse
 import os
 import sys
+import zipfile
+import base64
+import io
+
+class VFS:
+    """Виртуальная файловая система на основе ZIP-архива в памяти"""
+    
+    def __init__(self, base64_data=None, file_path=None):
+        self.zip_file = None
+        self.current_path = ""
+        
+        if base64_data:
+            self.load_from_base64(base64_data)
+        elif file_path:
+            self.load_from_file(file_path)
+    
+    def load_from_base64(self, base64_data):
+        """Загружает VFS из base64-строки"""
+        try:
+            zip_data = base64.b64decode(base64_data)
+            self.zip_file = zipfile.ZipFile(io.BytesIO(zip_data), 'r')
+        except Exception as e:
+            raise ValueError(f"Failed to load VFS from base64: {e}")
+    
+    def load_from_file(self, file_path):
+        """Загружает VFS из файла (ZIP или base64)"""
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"VFS file not found: {file_path}")
+        
+        # Проверяем расширение файла
+        if file_path.lower().endswith('.zip'):
+            # Прямо ZIP файл
+            self.zip_file = zipfile.ZipFile(file_path, 'r')
+        else:
+            # Предполагаем base64 encoded ZIP
+            with open(file_path, 'r', encoding='utf-8') as f:
+                base64_data = f.read()
+            self.load_from_base64(base64_data)
+    
+    def list_files(self, path=None):
+        """Возвращает список файлов и папок в указанном пути"""
+        if not self.zip_file:
+            return []
+        
+        target_path = path or self.current_path
+        if target_path and not target_path.endswith('/'):
+            target_path += '/'
+        
+        files = set()
+        folders = set()
+        
+        for name in self.zip_file.namelist():
+            # Обрабатываем файлы в текущей директории
+            if target_path:
+                if name.startswith(target_path):
+                    remaining = name[len(target_path):]
+                    if remaining:
+                        parts = remaining.split('/')
+                        if len(parts) > 1 or name.endswith('/'):
+                            folders.add(parts[0])
+                        else:
+                            files.add(remaining)
+            else:
+                # Корневая директория
+                parts = name.split('/')
+                if len(parts) > 1 or name.endswith('/'):
+                    folders.add(parts[0])
+                elif parts[0]:
+                    files.add(parts[0])
+        
+        return sorted(list(folders)), sorted(list(files))
+    
+    def read_file(self, file_path):
+        """Читает содержимое файла из VFS"""
+        if not self.zip_file:
+            return None
+        
+        # Нормализуем путь
+        if not file_path.startswith('/'):
+            file_path = os.path.join(self.current_path, file_path).replace('\\', '/')
+        
+        # Убираем ведущий слеш для совместимости с ZIP
+        if file_path.startswith('/'):
+            file_path = file_path[1:]
+        
+        try:
+            with self.zip_file.open(file_path, 'r') as f:
+                return f.read().decode('utf-8')
+        except Exception:
+            return None
+    
+    def change_directory(self, new_path):
+        """Изменяет текущую директорию в VFS"""
+        if not self.zip_file:
+            return False
+        
+        old_path = self.current_path
+        
+        if new_path == '/':
+            self.current_path = ""
+            return True
+        elif new_path.startswith('/'):
+            # Абсолютный путь
+            self.current_path = new_path[1:] if new_path.startswith('/') else new_path
+        else:
+            # Относительный путь
+            if not self.current_path:
+                self.current_path = new_path
+            else:
+                self.current_path = os.path.join(self.current_path, new_path).replace('\\', '/')
+        
+        # Нормализуем путь
+        if self.current_path and self.current_path.endswith('/'):
+            self.current_path = self.current_path[:-1]
+        
+        # Проверяем, что путь существует
+        folders, files = self.list_files()
+        if not folders and not files and self.current_path:
+            self.current_path = old_path
+            return False
+        
+        return True
+    
+    def get_current_path(self):
+        """Возвращает текущий путь в VFS"""
+        return '/' + self.current_path if self.current_path else '/'
 
 class Emulator:
     def __init__(self, root, vfs_path=None, script_path=None):
@@ -12,6 +138,14 @@ class Emulator:
 
         self.vfs_path = vfs_path
         self.script_path = script_path
+        self.vfs = None
+
+        # Инициализация VFS если путь указан
+        if self.vfs_path:
+            try:
+                self.vfs = VFS(file_path=self.vfs_path)
+            except Exception as e:
+                print(f"Failed to load VFS: {e}")
 
         self.bg_color = "#1E1E1E"
         self.fg_color = "#FFFFFF"
@@ -75,6 +209,7 @@ class Emulator:
             "\n=== Debug: startup parameters ===",
             f"VFS path    : {self.vfs_path!s}",
             f"Startup file: {self.script_path!s}",
+            f"VFS loaded  : {self.vfs is not None}",
             "=================================\n"
         ]
         self._append_output("\n".join(debug_lines))
@@ -111,6 +246,20 @@ class Emulator:
 
         cmd = parts[0].lower()
 
+        # --- Команды VFS ---
+        if cmd == 'vfs-ls':
+            self._vfs_ls(parts[1:] if len(parts) > 1 else [])
+            return
+        elif cmd == 'vfs-cat':
+            self._vfs_cat(parts[1:] if len(parts) > 1 else [])
+            return
+        elif cmd == 'vfs-cd':
+            self._vfs_cd(parts[1:] if len(parts) > 1 else [])
+            return
+        elif cmd == 'vfs-pwd':
+            self._vfs_pwd()
+            return
+
         # --- Управление параметрами через консоль ---
         if cmd == 'set':
             # синтаксис: set vfs <path>  или set script <path>
@@ -121,7 +270,12 @@ class Emulator:
             value = " ".join(parts[2:])  # поддержка путей с пробелами
             if key == 'vfs':
                 self.vfs_path = os.path.abspath(value)
-                self._append_output(f"[debug] VFS path set to: {self.vfs_path}\n")
+                try:
+                    self.vfs = VFS(file_path=self.vfs_path)
+                    self._append_output(f"[debug] VFS loaded from: {self.vfs_path}\n")
+                except Exception as e:
+                    self._append_output(f"[error] Failed to load VFS: {e}\n")
+                    self.vfs = None
             elif key == 'script':
                 self.script_path = os.path.abspath(value)
                 self._append_output(f"[debug] Startup script set to: {self.script_path}\n")
@@ -160,6 +314,60 @@ class Emulator:
                 self._append_output("cd: missing argument\n")
         else:
             self._append_output(f"{command}: command doesn't exist.\n")
+
+    def _vfs_ls(self, args):
+        """Команда списка файлов в VFS"""
+        if not self.vfs:
+            self._append_output("vfs-ls: VFS not loaded\n")
+            return
+        
+        path = args[0] if args else None
+        folders, files = self.vfs.list_files(path)
+        
+        self._append_output(f"Contents of {self.vfs.get_current_path()}:\n")
+        for folder in folders:
+            self._append_output(f"{folder}/\n")
+        for file in files:
+            self._append_output(f"{file}\n")
+        if not folders and not files:
+            self._append_output("(empty)\n")
+
+    def _vfs_cat(self, args):
+        """Команда чтения файла из VFS"""
+        if not self.vfs:
+            self._append_output("vfs-cat: VFS not loaded\n")
+            return
+        
+        if not args:
+            self._append_output("vfs-cat: missing file argument\n")
+            return
+        
+        content = self.vfs.read_file(args[0])
+        if content is not None:
+            self._append_output(f"=== Content of {args[0]} ===\n")
+            self._append_output(content + "\n")
+        else:
+            self._append_output(f"vfs-cat: {args[0]}: No such file or directory\n")
+
+    def _vfs_cd(self, args):
+        """Команда смены директории в VFS"""
+        if not self.vfs:
+            self._append_output("vfs-cd: VFS not loaded\n")
+            return
+        
+        path = args[0] if args else "/"
+        if self.vfs.change_directory(path):
+            self._append_output(f"Changed to {self.vfs.get_current_path()}\n")
+        else:
+            self._append_output(f"vfs-cd: {path}: No such directory\n")
+
+    def _vfs_pwd(self):
+        """Команда показа текущей директории в VFS"""
+        if not self.vfs:
+            self._append_output("vfs-pwd: VFS not loaded\n")
+            return
+        
+        self._append_output(f"Current VFS directory: {self.vfs.get_current_path()}\n")
 
     def run_startup_script(self):
         """Читает и выполняет команды из стартового скрипта (self.script_path).
